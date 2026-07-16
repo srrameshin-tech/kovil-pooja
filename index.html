@@ -685,17 +685,52 @@ function copyMsg(idx) {
 // ============================================================
 // PASSWORD PROTECTION
 // ============================================================
-const CORRECT_PASSWORD = 'Rame@#1973';
+// Password hashing (SHA-256) — auto-migrates legacy/plaintext password to a hash
+async function sha256Hex(str) {
+  const enc = new TextEncoder().encode(str);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function isHashFormat(str) { return typeof str === "string" && /^[a-f0-9]{64}$/i.test(str); }
+async function verifyPassword(entered, stored) {
+  if (!stored) return false;
+  if (isHashFormat(stored)) return (await sha256Hex(entered)) === stored;
+  return entered === stored; // legacy plaintext fallback
+}
+
+const CORRECT_PASSWORD = 'Rame@#1973'; // default fallback, used only until a password is set in Firebase
 const RECOVERY_EMAIL = 'ramesh@sramesh.in';
 const BREVO_API_KEY = 'xkeysib-placeholder'; // Replace with actual Brevo API key if needed
 
+// BUGFIX: previously "Forgot Password" saved the new password to Firebase (appConfig/password)
+// but checkPassword() never read it back — it only checked a sessionStorage key that was
+// never set anywhere, so a reset password could never actually be used to log in.
+let currentStoredPassword = null;
+let passwordLoaded = false;
+db.ref('appConfig/password').once('value').then(snap => {
+  currentStoredPassword = snap.val() || null;
+  passwordLoaded = true;
+}).catch(() => { passwordLoaded = true; });
+
 let generatedOTP = '';
 
-function checkPassword() {
+async function checkPassword() {
   const pw = document.getElementById('pwInput').value.trim();
-  const storedPw = sessionStorage.getItem('kp_custom_pw') || CORRECT_PASSWORD;
-  if (pw === storedPw) {
-      document.getElementById("lockOverlay").style.display = "none";
+  if (!passwordLoaded) {
+    await new Promise(res => {
+      const iv = setInterval(() => { if (passwordLoaded) { clearInterval(iv); res(); } }, 50);
+      setTimeout(() => { clearInterval(iv); res(); }, 3000);
+    });
+  }
+  const storedPw = currentStoredPassword || CORRECT_PASSWORD;
+  const ok = await verifyPassword(pw, storedPw);
+  if (ok) {
+    if (!isHashFormat(storedPw)) {
+      const hashed = await sha256Hex(pw);
+      db.ref('appConfig/password').set(hashed);
+      currentStoredPassword = hashed;
+    }
+    document.getElementById("lockOverlay").style.display = "none";
     sessionStorage.setItem('kp_auth', '1');
   } else {
     document.getElementById('pwError').textContent = '❌ தவறான Password! மீண்டும் try பண்ணுங்க.';
@@ -734,10 +769,12 @@ function verifyOTP() {
   }
 }
 
-function setNewPassword() {
+async function setNewPassword() {
   const newPw = document.getElementById('newPwInput').value.trim();
   if (!newPw) { document.getElementById('newPwError').textContent = '❌ Password உள்ளிடுங்கள்!'; return; }
-  db.ref('appConfig/password').set(newPw).then(() => {
+  const hashed = await sha256Hex(newPw);
+  db.ref('appConfig/password').set(hashed).then(() => {
+    currentStoredPassword = hashed;
     alert('✅ Password மாற்றப்பட்டது! Page reload ஆகும்.');
     location.reload();
   });
